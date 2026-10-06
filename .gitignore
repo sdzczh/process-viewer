@@ -1,0 +1,9 @@
+# 构建产物
+build/
+*.app
+
+# 系统
+.DS_Store
+
+# 临时
+/tmp/
