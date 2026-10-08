@@ -53,9 +53,14 @@ let excludeSubstrings = [
     "WindowServer", "/Library/PrivilegedHelperTools",
 ]
 
-func classify(_ command: String) -> (family: String, base: String)? {
+// 命令行第一个字段（可执行文件路径）的文件名部分。
+func exeBaseName(_ command: String) -> String {
     let argv0 = command.split(separator: " ").first.map(String.init) ?? ""
-    let base = (argv0 as NSString).lastPathComponent
+    return (argv0 as NSString).lastPathComponent
+}
+
+func classify(_ command: String) -> (family: String, base: String)? {
+    let base = exeBaseName(command)
     let lower = base.lowercased()
     for (prefix, fam) in familyPrefixes where lower.hasPrefix(prefix) {
         return (fam, base)
@@ -67,6 +72,9 @@ func isExcluded(_ command: String) -> Bool {
     for s in excludeSubstrings where command.contains(s) { return true }
     return false
 }
+
+// 兜底规则用到的 family 名：不属于任何已知开发工具链、但确实在监听 TCP 端口的进程。
+let otherFamily = "other"
 
 // MARK: - Project grouping
 
@@ -100,6 +108,42 @@ func projectRoot(from cwd: String?) -> String {
 
 // MARK: - lsof parsing
 
+// lsof 的 -F 机器可读输出会把非 ASCII 字节转义成 \xHH（中文路径因此变成乱码串），
+// 这里还原成真正的 UTF-8 文本。
+private func hexVal(_ b: UInt8) -> Int? {
+    switch b {
+    case 0x30...0x39: return Int(b - 0x30)
+    case 0x61...0x66: return Int(b - 0x61 + 10)
+    case 0x41...0x46: return Int(b - 0x41 + 10)
+    default: return nil
+    }
+}
+
+func unescapeLsof(_ s: String) -> String {
+    let raw = Array(s.utf8)
+    var bytes: [UInt8] = []
+    bytes.reserveCapacity(raw.count)
+    var i = 0
+    while i < raw.count {
+        if raw[i] == 0x5C, i + 1 < raw.count {
+            switch raw[i + 1] {
+            case 0x5C: bytes.append(0x5C); i += 2; continue          // \\
+            case 0x6E: bytes.append(0x0A); i += 2; continue          // \n
+            case 0x72: bytes.append(0x0D); i += 2; continue          // \r
+            case 0x74: bytes.append(0x09); i += 2; continue          // \t
+            case 0x78:                                                // \xHH
+                if i + 3 < raw.count,
+                   let hi = hexVal(raw[i + 2]), let lo = hexVal(raw[i + 3]) {
+                    bytes.append(UInt8(hi << 4 | lo)); i += 4; continue
+                }
+            default: break
+            }
+        }
+        bytes.append(raw[i]); i += 1
+    }
+    return String(decoding: bytes, as: UTF8.self)
+}
+
 // Walks lsof -F output, tracking current pid, collecting `n` (name) values per pid.
 func parseLsofNames(_ text: String) -> [Int: [String]] {
     var result: [Int: [String]] = [:]
@@ -111,7 +155,7 @@ func parseLsofNames(_ text: String) -> [Int: [String]] {
         if first == "p" {
             currentPid = Int(rest)
         } else if first == "n", let pid = currentPid {
-            result[pid, default: []].append(rest)
+            result[pid, default: []].append(unescapeLsof(rest))
         }
     }
     return result
@@ -130,32 +174,36 @@ struct RawProc {
     let ppid: Int
     let cpu: Double
     let mem: Double
+    let uid: Int
     let command: String
 }
 
 func gatherProcs() -> [ProcInfo] {
-    let psOut = shell("/bin/ps", ["-axo", "pid=,ppid=,pcpu=,pmem=,command="])
-    var candidates: [RawProc] = []
+    let myUid = Int(getuid())
+    let myPid = Int(ProcessInfo.processInfo.processIdentifier)
+
+    // 第一遍：拉全量进程表，只做「当前用户 + 非噪音」的粗筛，
+    // 不再要求命中开发工具白名单——是否有监听端口留到第二遍判断。
+    let psOut = shell("/bin/ps", ["-axo", "pid=,ppid=,pcpu=,pmem=,uid=,command="])
+    var rows: [RawProc] = []
     for raw in psOut.split(separator: "\n") {
         let line = String(raw)
-        let parts = line.split(separator: " ", maxSplits: 4, omittingEmptySubsequences: true)
-        guard parts.count == 5,
+        let parts = line.split(separator: " ", maxSplits: 5, omittingEmptySubsequences: true)
+        guard parts.count == 6,
               let pid = Int(parts[0]),
               let ppid = Int(parts[1]),
               let cpu = Double(parts[2]),
-              let mem = Double(parts[3]) else { continue }
-        let command = String(parts[4])
+              let mem = Double(parts[3]),
+              let uid = Int(parts[4]) else { continue }
+        let command = String(parts[5]).trimmingCharacters(in: .whitespaces)
+        if uid != myUid || pid == myPid { continue }
         if isExcluded(command) { continue }
-        if classify(command) == nil { continue }
-        candidates.append(RawProc(pid: pid, ppid: ppid, cpu: cpu, mem: mem, command: command))
+        rows.append(RawProc(pid: pid, ppid: ppid, cpu: cpu, mem: mem, uid: uid, command: command))
     }
-    guard !candidates.isEmpty else { return [] }
 
-    let pidList = candidates.map { String($0.pid) }.joined(separator: ",")
-    let cwdText = shell("/usr/sbin/lsof", ["-a", "-d", "cwd", "-Fn", "-p", pidList])
-    let portText = shell("/usr/sbin/lsof", ["-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-p", pidList, "-Fn"])
-
-    let cwdMap = parseLsofNames(cwdText).mapValues { $0.first ?? "" }
+    // 第二遍：一次性取全机 TCP LISTEN 端口表（不限 pid），
+    // 这样「编译好的独立二进制」这种不匹配任何解释器前缀的监听进程也能被发现。
+    let portText = shell("/usr/sbin/lsof", ["-nP", "-iTCP", "-sTCP:LISTEN", "-Fn"])
     let portMap = parseLsofNames(portText).mapValues { names in
         var seen = Set<String>()
         var ordered: [String] = []
@@ -167,13 +215,23 @@ func gatherProcs() -> [ProcInfo] {
         return ordered.sorted { (Int($0) ?? 0) < (Int($1) ?? 0) }
     }
 
+    // 候选 = 命中开发工具白名单的进程 ∪ 正在监听 TCP 端口的进程
+    let candidates = rows.filter { classify($0.command) != nil || !(portMap[$0.pid] ?? []).isEmpty }
+    guard !candidates.isEmpty else { return [] }
+
+    let pidList = candidates.map { String($0.pid) }.joined(separator: ",")
+    let cwdText = shell("/usr/sbin/lsof", ["-a", "-d", "cwd", "-Fn", "-p", pidList])
+    let cwdMap = parseLsofNames(cwdText).mapValues { $0.first ?? "" }
+
     var procs: [ProcInfo] = []
     for c in candidates {
-        guard let cls = classify(c.command) else { continue }
+        let cls = classify(c.command)
         let cwd = cwdMap[c.pid]
         procs.append(ProcInfo(
             pid: c.pid, ppid: c.ppid, cpu: c.cpu, mem: c.mem,
-            family: cls.family, exeBase: cls.base, command: c.command,
+            family: cls?.family ?? otherFamily,
+            exeBase: cls?.base ?? exeBaseName(c.command),
+            command: c.command,
             cwd: (cwd?.isEmpty == false) ? cwd : nil,
             ports: portMap[c.pid] ?? [],
             project: projectRoot(from: (cwd?.isEmpty == false) ? cwd : nil)
@@ -190,6 +248,7 @@ final class Store: ObservableObject {
     @Published var lastRefresh: Date? = nil
     @Published var query = ""
     @Published var onlyWithPorts = false
+    @Published var includeOthers = true
     @Published var autoRefresh = false {
         didSet { autoRefresh ? startTimer() : stopTimer() }
     }
@@ -226,6 +285,7 @@ final class Store: ObservableObject {
     var filtered: [ProcInfo] {
         var list = procs
         if onlyWithPorts { list = list.filter { !$0.ports.isEmpty } }
+        if !includeOthers { list = list.filter { $0.family != otherFamily } }
         let q = query.trimmingCharacters(in: .whitespaces).lowercased()
         if !q.isEmpty {
             list = list.filter {
@@ -255,6 +315,7 @@ func familyColor(_ f: String) -> Color {
     case "go": return .cyan
     case "ruby": return .red
     case "rust": return .purple
+    case "other": return .gray
     default: return .gray
     }
 }
@@ -349,7 +410,7 @@ struct ContentView: View {
                         Spacer()
                         VStack(spacing: 8) {
                             Image(systemName: "tray").font(.system(size: 34)).foregroundColor(.secondary)
-                            Text(store.loading ? "正在扫描…" : "没有匹配的开发进程")
+                            Text(store.loading ? "正在扫描…" : "没有发现开发进程或监听端口")
                                 .foregroundColor(.secondary)
                         }
                         Spacer()
@@ -383,6 +444,7 @@ struct ContentView: View {
                     Text("更新于 \(timeString(d))").font(.caption).foregroundColor(.secondary)
                 }
                 Spacer()
+                Toggle("含其他监听进程", isOn: $store.includeOthers).toggleStyle(.switch).font(.caption)
                 Toggle("仅显示监听端口", isOn: $store.onlyWithPorts).toggleStyle(.switch).font(.caption)
                 Toggle("自动刷新 5s", isOn: $store.autoRefresh).toggleStyle(.switch).font(.caption)
             }
