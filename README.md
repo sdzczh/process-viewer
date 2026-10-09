@@ -6,6 +6,11 @@
 
 - 扫描 `node / python / uv / java / go / deno / bun / ruby / npm / vite / uvicorn / gunicorn` 等解释器进程，自动排除系统应用、微信、Steam、Adobe、Qoder 自身等噪音。
 - **端口兜底规则**：凡是当前用户进程有 TCP LISTEN 端口的，即使不匹配任何解释器前缀（例如自己编译的独立二进制 `./copytrade-local`）也会被收进来，family 标记为 `other`。可用底栏「含其他监听进程」开关隐藏。
+- **端口绑定详情**：徽章区分非常规绑定——仅 IPv6 显示 `:3000 v6`、仅回环显示 `:6379 lo`；点击行展开可看每条 `TCPv4/TCPv6 地址:端口` 明细。
+- **进程树折叠**：`npm run dev` 这类父子链（npm → sh → node）折叠成一行，子进程端口/CPU/MEM 合并到根行，行内 `+N` 角标提示子进程数，展开可见成员。
+- **变化高亮**：刷新后新出现的行闪绿 4 秒；刚退出的行以红底删除线留影 6 秒并标「已退出」。
+- 行菜单支持「重新启动」（在原 cwd 用原命令经 `/bin/sh -c` 拉起）和「在浏览器打开 :端口」。
+- 次行显示运行时长（ps etime），方便认出忘了关的老 dev server。
 - 用 `lsof` 读取每个进程的监听端口（TCP LISTEN）和工作目录（cwd）。
 - 按项目根目录分组：从 cwd 向上查找 `.git / package.json / pyproject.toml / pom.xml / go.mod` 等标记文件定位项目根。
 - 一键结束：`正常结束 (kill -15 / SIGTERM)` 或 `强制结束 (kill -9 / SIGKILL)`，带二次确认。
@@ -29,8 +34,8 @@ cp -R build/ProcessViewer.app "/Applications/进程查看器.app"
 
 ## 原理
 
-- 进程列表：`ps -axo pid=,ppid=,pcpu=,pmem=,uid=,command=`（只保留 `uid == 当前用户` 且不在排除名单里的行）
-- 端口：`lsof -nP -iTCP -sTCP:LISTEN -Fn`（**全机一次取回**，不按 pid 过滤，这样非解释器类的监听进程也能被发现）
+- 进程列表：`ps -axo pid=,ppid=,pcpu=,pmem=,uid=,etime=,command=`（只保留 `uid == 当前用户` 且不在排除名单里的行）
+- 端口：`lsof -nP -iTCP -sTCP:LISTEN -Ftn`（**全机一次取回**，不按 pid 过滤；`t` 字段给出 IPv4/IPv6，`n` 字段给出绑定地址）
 - 候选集：命中解释器白名单的进程 ∪ 出现在上面端口表里的进程
 - 工作目录：`lsof -a -d cwd -Fn -p <候选pid列表>`
 - 结束：`/bin/kill -15|-9 <pid>`
@@ -43,3 +48,4 @@ cp -R build/ProcessViewer.app "/Applications/进程查看器.app"
 
 - 首次运行若系统提示权限，允许即可（读取进程信息无需特殊授权，均为当前用户自己的进程）。
 - 关闭窗口即退出应用（按需打开的工具，不常驻）。
+- 底栏三个开关（含其他监听进程 / 仅显示监听端口 / 自动刷新）经 UserDefaults 持久化，重启保留。
